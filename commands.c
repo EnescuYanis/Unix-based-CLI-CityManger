@@ -3,11 +3,13 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 
 // ============================================================
 //  VISUAL UI HELPERS
@@ -200,6 +202,38 @@ void make_directory_with_cfg(const char* filepath, const char* dir_name) {
 }
 
 // ============================================================
+//  MONITOR NOTIFICATION (Phase 2)
+// ============================================================
+
+static void notify_monitor(const char *district_id, const char *role, const char *user) {
+    int fd = open(".monitor_pid", O_RDONLY);
+    if (fd == -1) {
+        log_action(district_id, role, user, "add: monitor not notified (no .monitor_pid file)");
+        return;
+    }
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        log_action(district_id, role, user, "add: monitor not notified (unreadable .monitor_pid)");
+        return;
+    }
+    buf[n] = '\0';
+    pid_t mon_pid = (pid_t)atoi(buf);
+
+    char msg[256];
+    if (kill(mon_pid, SIGUSR1) == 0) {
+        snprintf(msg, sizeof(msg), "add: monitor PID %d notified via SIGUSR1", (int)mon_pid);
+        printf("  " COLOR_GREEN "⚑" COLOR_RESET "  Monitor (PID %d) notified.\n", (int)mon_pid);
+    } else {
+        snprintf(msg, sizeof(msg), "add: could not notify monitor PID %d (%s)",
+                 (int)mon_pid, strerror(errno));
+        printf("  " COLOR_YELLOW "⚠  Could not notify monitor: %s\n" COLOR_RESET, strerror(errno));
+    }
+    log_action(district_id, role, user, msg);
+}
+
+// ============================================================
 //  ADD
 // ============================================================
 
@@ -288,6 +322,8 @@ void handle_add(const char *district_id, const char *role, const char *user) {
     snprintf(action_buf, sizeof(action_buf), "add report_id=%d", new_record.id);
     log_action(district_id, role, user, action_buf);
 
+    notify_monitor(district_id, role, user);
+
     printf("  " COLOR_GREEN STYLE_BOLD "✓  Report saved!" COLOR_RESET
            "  ID: " STYLE_BOLD COLOR_YELLOW "%d" COLOR_RESET "\n\n", new_record.id);
 }
@@ -296,31 +332,107 @@ void handle_add(const char *district_id, const char *role, const char *user) {
 //  REMOVE Direcortory (by ID, with compaction)
 // ============================================================
 
-    void handle_remove_district(const char *district_id, const char *role, const char *user) {
+void handle_remove_district(const char *district_id, const char *role, const char *user) {
+    (void)user;
+    if (strcmp(role, "manager") != 0) {
+        printf(COLOR_RED "  ╳  Only managers may remove districts.\n\n" COLOR_RESET);
+        return;
+    }
+    if (!check_role_permission(district_id, role, 1)) return;
 
-        if(strcmp(role, "manager") != 0) {
-            printf(COLOR_RED "  ╳  Only managers may remove reports.\n\n" COLOR_RESET);
-            return;
-        }
-        if(!check_role_permission(district_id, role, 1)) return;
-        char command[256];
-        char link_file_name[1024];
-        snprintf(link_file_name, sizeof(link_file_name), "active_reports-%s", district_id);
-        snprintf(command, sizeof(command), "rm -r %s %s", district_id , link_file_name);
-        int ret = system(command);
-        if(ret == -1) {
-            printf(COLOR_RED "  ✗  Failed to execute remove command.\n\n" COLOR_RESET);
-            return;
-        }
-        printf("  " COLOR_GREEN STYLE_BOLD "✓  District '%s' removed.\n\n" COLOR_RESET, district_id);
-        char action_buf[128];
-        snprintf(action_buf, sizeof(action_buf), "remove district");
-        log_action(district_id, role, user, action_buf);
+    char link_name[256];
+    snprintf(link_name, sizeof(link_name), "active_reports-%s", district_id);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return;
+    }
+    if (pid == 0) {
+        /* child: delete district directory and its symlink */
+        execlp("rm", "rm", "-rf", district_id, link_name, (char *)NULL);
+        perror("execlp rm");
+        _exit(1);
     }
 
-    // ============================================================
-    //  LIST  (table layout)
-    // ============================================================
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        printf("  " COLOR_GREEN STYLE_BOLD "✓  District '%s' removed.\n\n" COLOR_RESET, district_id);
+    else
+        printf(COLOR_RED "  ✗  Failed to remove district '%s'.\n\n" COLOR_RESET, district_id);
+}
+
+// ============================================================
+//  REMOVE REPORT (by ID, Phase 1)
+// ============================================================
+
+void handle_remove_report(const char *district_id, const char *report_id,
+                          const char *role, const char *user) {
+    print_banner(role, user);
+
+    if (strcmp(role, "manager") != 0) {
+        printf(COLOR_RED "  ╳  Only managers may remove reports.\n\n" COLOR_RESET);
+        return;
+    }
+
+    char file_path[2048];
+    snprintf(file_path, sizeof(file_path), "%s/reports.dat", district_id);
+    if (!check_role_permission(file_path, role, 1)) return;
+
+    int target_id = atoi(report_id);
+    int fd = open(file_path, O_RDWR);
+    if (fd == -1) {
+        printf(COLOR_RED "  ✗  Cannot open %s\n\n" COLOR_RESET, file_path);
+        return;
+    }
+
+    /* Locate the record to remove */
+    Record r;
+    off_t remove_pos = -1;
+    off_t cur = 0;
+    while (read(fd, &r, sizeof(Record)) == (ssize_t)sizeof(Record)) {
+        if (r.id == target_id) { remove_pos = cur; break; }
+        cur += (off_t)sizeof(Record);
+    }
+
+    if (remove_pos == -1) {
+        printf(COLOR_YELLOW "  ⚠  Report ID %d not found in '%s'.\n\n" COLOR_RESET,
+               target_id, district_id);
+        close(fd);
+        return;
+    }
+
+    /* Shift every subsequent record one slot earlier using lseek */
+    off_t rpos = remove_pos + (off_t)sizeof(Record);
+    off_t wpos = remove_pos;
+    while (1) {
+        lseek(fd, rpos, SEEK_SET);
+        ssize_t n = read(fd, &r, sizeof(Record));
+        if (n != (ssize_t)sizeof(Record)) break;
+        lseek(fd, wpos, SEEK_SET);
+        write(fd, &r, sizeof(Record));
+        rpos += (off_t)sizeof(Record);
+        wpos += (off_t)sizeof(Record);
+    }
+
+    /* Shrink the file by one record */
+    struct stat st;
+    fstat(fd, &st);
+    ftruncate(fd, st.st_size - (off_t)sizeof(Record));
+    close(fd);
+
+    printf("  " COLOR_GREEN STYLE_BOLD "✓  Report %d removed from '%s'.\n\n" COLOR_RESET,
+           target_id, district_id);
+
+    char action_buf[128];
+    snprintf(action_buf, sizeof(action_buf), "remove_report report_id=%d", target_id);
+    log_action(district_id, role, user, action_buf);
+}
+
+// ============================================================
+//  LIST  (table layout)
+// ============================================================
 
     void handle_list(const char *district_id, const char *role, const char *user) {
         print_banner(role, user);
@@ -655,7 +767,8 @@ void handle_help(void) {
         {"--add <district>",               "Append a new report"},
         {"--list <district>",              "List all reports + file info"},
         {"--view <district> <id>",         "Print full report details"},
-        {"--remove_district <district_id> ","Remove a district (manager only)"},
+        {"--remove_report <district> <id>","Remove a report by ID (manager only)"},
+        {"--remove_district <district>",   "Remove entire district (manager only)"},
         {"--update_threshold <d> <val>",   "Update severity threshold (manager)"},
         {"--filter <district> <cond...>",  "Filter: field:op:value"},
         {"--help",                         "Show this menu"},

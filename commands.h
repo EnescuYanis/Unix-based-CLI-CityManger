@@ -20,6 +20,7 @@ typedef struct {
 void make_directory_with_cfg(const char* filepath, const char* dir_name);
 void handle_add(const char *district_id, const char *role, const char *user);
 void handle_remove_district(const char *district_id, const char *role, const char *user);
+void handle_remove_report(const char *district_id, const char *report_id, const char *role, const char *user);
 void handle_list(const char *district_id, const char *role, const char *user);
 void handle_view(const char *district_id, const char *report_id, const char *role, const char *user);
 void handle_update_threshold(const char *district_id, const char *value, const char *role, const char *user);
